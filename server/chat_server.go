@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -20,7 +22,9 @@ const (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 type Client struct {
@@ -37,22 +41,26 @@ type Hub struct {
 	register    chan *Client
 	unregister  chan *Client
 	redisClient *redis.Client
+	db          *sql.DB
 	ctx         context.Context
 }
 
 type Message struct {
-	Username string `json:"username"`
-	Content  string `json:"content"`
-	Server   string `json:"server"`
+	ID        int64  `json:"id,omitempty"`
+	Username  string `json:"username"`
+	Content   string `json:"content"`
+	Server    string `json:"server,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
-func newHub(address string, redisClient *redis.Client) *Hub {
+func newHub(address string, redisClient *redis.Client, db *sql.DB) *Hub {
 	return &Hub{
 		address:     address,
 		clients:     make(map[*Client]bool),
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
 		redisClient: redisClient,
+		db:          db,
 		ctx:         context.Background(),
 	}
 }
@@ -73,7 +81,11 @@ func (h *Hub) run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
+				select {
+				case <-client.send:
+				default:
+					close(client.send)
+				}
 				log.Printf("[Server %s] Client '%s' disconnected. Total clients: %d\n", h.address, client.username, h.getLoad())
 			}
 			h.mu.Unlock()
@@ -85,22 +97,52 @@ func (h *Hub) run() {
 func (h *Hub) listenToRedis() {
 	pubsub := h.redisClient.Subscribe(h.ctx, redisChannel)
 	defer pubsub.Close()
-
 	ch := pubsub.Channel()
-	log.Printf("[Server %s] Subscribed to Redis channel '%s'\n", h.address, redisChannel)
 
-	for msg := range ch {
+	for rawMsg := range ch {
 		h.mu.Lock()
+		var clientsToRemove []*Client
 		for client := range h.clients {
 			select {
-			case client.send <- []byte(msg.Payload):
+			case client.send <- []byte(rawMsg.Payload):
 			default:
-				close(client.send)
-				delete(h.clients, client)
+				clientsToRemove = append(clientsToRemove, client)
 			}
 		}
 		h.mu.Unlock()
+
+		for _, client := range clientsToRemove {
+			h.unregister <- client
+		}
 	}
+}
+
+func (h *Hub) handleGetHistory(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.db.Query("SELECT id, username, message, server, timestamp FROM messages ORDER BY timestamp DESC LIMIT 50")
+	if err != nil {
+		http.Error(w, "Failed to retrieve message history", http.StatusInternalServerError)
+		log.Printf("DB query error: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var msg Message
+		if err := rows.Scan(&msg.ID, &msg.Username, &msg.Content, &msg.Server, &msg.Timestamp); err != nil {
+			http.Error(w, "Failed to scan message row", http.StatusInternalServerError)
+			log.Printf("DB scan error: %v", err)
+			return
+		}
+		messages = append(messages, msg)
+	}
+
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(messages)
 }
 
 func (c *Client) readPump() {
@@ -108,26 +150,47 @@ func (c *Client) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
+
+	c.conn.SetReadLimit(512)
+	c.conn.SetPongHandler(func(string) error { return nil })
+
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
+				log.Printf("[Server %s] Client '%s' unexpected close error: %v", c.hub.address, c.username, err)
+			} else {
+				log.Printf("[Server %s] Client '%s' disconnected normally", c.hub.address, c.username)
 			}
 			break
 		}
 
-		msg := Message{
-			Username: c.username,
-			Content:  string(message),
-			Server:   c.hub.address,
-		}
-		msgBytes, err := json.Marshal(msg)
-		if err != nil {
-			log.Printf("Error marshalling message: %v", err)
+		var incomingMsg Message
+		if err := json.Unmarshal(message, &incomingMsg); err != nil {
+			log.Printf("Error parsing incoming message JSON: %v", err)
 			continue
 		}
 
+		msg := Message{
+			Username: c.username,
+			Content:  incomingMsg.Content,
+			Server:   c.hub.address,
+		}
+
+		stmt, err := c.hub.db.Prepare("INSERT INTO messages(username, message, server) VALUES(?, ?, ?)")
+		if err != nil {
+			log.Printf("Error preparing db statement: %v", err)
+			continue
+		}
+		_, err = stmt.Exec(msg.Username, msg.Content, msg.Server)
+		if err != nil {
+			log.Printf("Error executing db statement: %v", err)
+			stmt.Close()
+			continue
+		}
+		stmt.Close()
+
+		msgBytes, _ := json.Marshal(msg)
 		if err := c.hub.redisClient.Publish(c.hub.ctx, redisChannel, msgBytes).Err(); err != nil {
 			log.Printf("Error publishing to Redis: %v", err)
 		}
@@ -135,7 +198,10 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	defer func() {
+		c.conn.Close()
+	}()
+
 	for {
 		select {
 		case message, ok := <-c.send:
@@ -144,10 +210,26 @@ func (c *Client) writePump() {
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Printf("[Server %s] Client '%s' write error: %v", c.hub.address, c.username, err)
 				return
 			}
 		}
 	}
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Hub) getLoad() int {
@@ -216,6 +298,24 @@ func main() {
 
 	address := fmt.Sprintf("ws://%s:%d", *host, *port)
 
+	db, err := sql.Open("sqlite3", "./chat.db?_journal_mode=WAL")
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	createTableSQL := `CREATE TABLE IF NOT EXISTS messages (
+		"id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+		"username" TEXT,
+		"message" TEXT,
+		"server" TEXT,
+		"timestamp" DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	_, err = db.Exec(createTableSQL)
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: *redisAddr,
 	})
@@ -223,17 +323,19 @@ func main() {
 		log.Fatalf("Could not connect to Redis on %s: %v", *redisAddr, err)
 	}
 
-	hub := newHub(address, redisClient)
-
+	hub := newHub(address, redisClient, db)
 	hub.registerWithLB()
-
 	go hub.run()
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/history", hub.handleGetHistory)
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, w, r)
 	})
 
+	handler := corsMiddleware(mux)
+
 	listenAddr := fmt.Sprintf("%s:%d", *host, *port)
-	log.Printf("[ChatServer] starting on %s, connecting to Redis on %s\n", listenAddr, *redisAddr)
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
+	log.Printf("[ChatServer] starting on %s, serving /ws and /history\n", listenAddr)
+	log.Fatal(http.ListenAndServe(listenAddr, handler))
 }
