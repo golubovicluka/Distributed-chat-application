@@ -24,7 +24,7 @@ function App() {
     try {
       setConnectionStatus('Getting optimal server...')
       const serverAddress = await getOptimalServer()
-      
+
       setConnectionStatus('Loading chat history...')
       const history = await getChatHistory(serverAddress)
       setMessages(history || [])
@@ -34,7 +34,6 @@ function App() {
         serverAddress,
         inputUsername,
         (message) => {
-          // Add a unique ID if not present
           const messageWithId = {
             ...message,
             id: message.id || Date.now() + Math.random(),
@@ -66,8 +65,6 @@ function App() {
   }
 
   const handleSendMessage = (content: string) => {
-    console.log('App handleSendMessage called with:', content)
-    console.log('WebSocket instance exists:', !!websocket)
     websocket?.sendMessage(content)
   }
 

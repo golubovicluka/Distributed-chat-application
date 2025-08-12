@@ -81,28 +81,23 @@ func (h *Hub) run() {
 	for {
 		select {
 		case client := <-h.register:
-			// register client
 			h.mu.Lock()
 			h.clients[client] = true
 			load := len(h.clients)
 			h.mu.Unlock()
 
 			log.Printf("[Server %s] Client '%s' connected. Total clients: %d\n", h.address, client.username, load)
-			// update LB outside lock
 			h.updateLBLoad()
 
 		case client := <-h.unregister:
-			// unregister client
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				// close the send channel exactly once
 				client.closeOnce.Do(func() { close(client.send) })
 				load := len(h.clients)
 				h.mu.Unlock()
 
 				log.Printf("[Server %s] Client '%s' disconnected. Total clients: %d\n", h.address, client.username, load)
-				// update LB outside lock
 				h.updateLBLoad()
 			} else {
 				h.mu.Unlock()
@@ -130,9 +125,7 @@ func (h *Hub) listenToRedis() {
 			for client := range h.clients {
 				select {
 				case client.send <- []byte(rawMsg.Payload):
-					// sent
 				default:
-					// client is slow/unresponsive — schedule removal
 					clientsToRemove = append(clientsToRemove, client)
 				}
 			}
@@ -242,7 +235,6 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// hub closed the channel
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
@@ -253,7 +245,6 @@ func (c *Client) writePump() {
 			}
 
 		case <-ticker.C:
-			// send ping
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				log.Printf("[Server %s] Client '%s' ping error: %v", c.hub.address, c.username, err)
