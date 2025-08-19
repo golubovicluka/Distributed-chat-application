@@ -211,11 +211,3 @@ go mod tidy      # Clean up dependencies
 * `@radix-ui/react-slot` - UI primitives
 * `lucide-react` - Icons
 * `eslint` - Code linting
-
-## 📂 Project Structure
-
-```
-CS230-PZ-LukaGolubovic6356/
-```
-
----
