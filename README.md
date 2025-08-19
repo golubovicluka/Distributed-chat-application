@@ -19,6 +19,7 @@ This application consists of three main components working together to provide s
 ### Chat Server (`server/`)
 
 - **Technology**: Go with WebSocket support and Redis pub/sub
+- **Architecture**: Modular package structure following Go best practices
 - **Features**:
   - Configurable host/port (default: 127.0.0.1:8080)
   - SQLite database for message persistence
@@ -27,7 +28,13 @@ This application consists of three main components working together to provide s
   - Continuous client load reporting to load balancer
   - WebSocket endpoint with ping/pong health checks
   - Chat history API endpoint (`/history`)
-  - File logging to `chat.log`
+  - CORS middleware for cross-origin requests
+- **Benefits of Refactored Architecture**:
+  - **Maintainability**: Easy to locate and modify specific functionality
+  - **Testability**: Individual packages can be tested in isolation
+  - **Team Development**: Multiple developers can work on different modules
+  - **Code Clarity**: Each package has a single, clear responsibility
+  - **Go Best Practices**: Proper package organization with clean module imports
 
 ### Chat Frontend (`chat-app/`)
 
@@ -42,11 +49,14 @@ This application consists of three main components working together to provide s
 
 ## Database Schema
 
+The database schema is defined in `server/database/db.go`:
+
 ```sql
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT,
     message TEXT,
+    server TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 ```
@@ -241,17 +251,43 @@ CS230-PZ-LukaGolubovic6356/
 │   │   └── lib/             # Utility functions
 │   ├── package.json
 │   └── vite.config.ts
-├── server/                   # Go chat server with WebSocket support
-│   ├── chat_server.go       # Main server implementation
+├── server/                   # Go chat server with modular architecture
+│   ├── main.go              # Application bootstrap and dependency wiring
+│   ├── models/              # Data structures and types
+│   │   └── message.go       # Message model definition
+│   ├── database/            # Database operations and schema
+│   │   └── db.go            # SQLite initialization and table creation
+│   ├── client/              # WebSocket client management
+│   │   └── client.go        # Client connection handling and message pumps
+│   ├── hub/                 # Client connection hub and message broadcasting
+│   │   └── hub.go           # Central message distribution and Redis pub/sub
+│   ├── handlers/            # HTTP request handlers
+│   │   ├── websocket.go     # WebSocket upgrade and connection handling
+│   │   └── history.go       # Chat history API endpoint
+│   ├── middleware/          # HTTP middleware
+│   │   └── cors.go          # Cross-origin request handling
+│   ├── loadbalancer/        # Load balancer communication
+│   │   └── client.go        # Registration and load reporting
 │   ├── go.mod               # Go module dependencies
 │   ├── go.sum               # Dependency checksums
-│   ├── chat.db              # SQLite database (auto-generated)
-│   └── chat.log             # Server logs (auto-generated)
+│   └── chat.db              # SQLite database (auto-generated)
 ├── loadbalancer/            # Go load balancer (standalone)
 │   └── main.go              # Load balancer implementation
 ├── CLAUDE.md               # Development instructions for Claude Code
 └── README.md              # This file
 ```
+
+### Server Package Responsibilities
+
+- **`main.go`** (56 lines): Application entry point, dependency injection, and HTTP server setup
+- **`models/message.go`** (9 lines): Message data structure with JSON serialization tags
+- **`database/db.go`** (32 lines): SQLite database initialization, schema creation, and table setup
+- **`client/client.go`** (95 lines): WebSocket client lifecycle, read/write message pumps, and connection management
+- **`hub/hub.go`** (108 lines): Central message hub, client registry, Redis pub/sub integration, and broadcast logic
+- **`handlers/websocket.go`** (37 lines): WebSocket protocol upgrade and client authentication
+- **`handlers/history.go`** (33 lines): REST API endpoint for retrieving chat message history
+- **`middleware/cors.go`** (16 lines): Cross-origin resource sharing configuration for browser compatibility
+- **`loadbalancer/client.go`** (40 lines): Load balancer registration and periodic load reporting
 
 ## Features
 
@@ -260,9 +296,11 @@ CS230-PZ-LukaGolubovic6356/
 - **Message Persistence**: SQLite database storage with chat history API
 - **Scalability**: Redis pub/sub enables horizontal scaling of chat servers
 - **Modern UI**: Responsive design with shadcn/ui components and Tailwind CSS
-- **Developer Experience**: Hot reload, TypeScript support, and comprehensive linting
+- **Modular Architecture**: Clean separation of concerns with single-responsibility packages
+- **Developer Experience**: Hot reload, TypeScript support, comprehensive linting, and maintainable code structure
 - **Health Monitoring**: WebSocket ping/pong mechanism and server load reporting
 - **CORS Support**: Cross-origin resource sharing for browser compatibility
+- **Code Quality**: Go best practices with testable, modular design for enterprise-grade development
 
 ## Troubleshooting
 
